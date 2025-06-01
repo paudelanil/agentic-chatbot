@@ -303,7 +303,6 @@ class MemoryManager:
             if memory.get('embedding'):
                 similarity = cosine_similarity([query_embedding], [memory['embedding']])[0][0]
                 similarities.append((memory, similarity))
-        print("Similarities calculated:", similarities)
         # Sort by similarity and return top_k
         similarities.sort(key=lambda x: x[1], reverse=True)
         return [mem for mem, _ in similarities[:top_k]]
