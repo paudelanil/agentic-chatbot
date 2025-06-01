@@ -30,7 +30,7 @@ def upload_file():
         else:
             file_content = file.read().decode("utf-8")
 
-        file_data = agent_core.rag_manager.process_file(file_content, file.filename)
+        file_data = agent_core.rag_manager.process_file(file_content, file.filename,user_id)
         db_manager.save_file(user_id, file_data)
 
         return jsonify({
@@ -55,3 +55,19 @@ def get_files():
         for f in files
         ]
     return jsonify({"files": files_info})
+
+@files_bp.route("/remove", methods=["POST"])
+@get_or_create_user_session()
+def remove_file():
+    user_id = request.user_id
+    data = request.get_json()
+    file_id = data.get("file_id")
+    if not file_id:
+        return jsonify({"error": "No file_id provided"}), 400
+    try:
+        removed = db_manager.remove_file(user_id, file_id)
+        if not removed:
+            return jsonify({"error": "File not found or could not be removed"}), 404
+        return jsonify({"message": f"File {file_id} removed successfully"})
+    except Exception as e:
+        return jsonify({"error": f"Error removing file: {str(e)}"}), 500

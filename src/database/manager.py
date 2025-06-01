@@ -285,6 +285,19 @@ class DatabaseManager:
             logger.info(f"Deleted {deleted_count} files for user {user_id}")
             return deleted_count
     
+    def remove_file(self, user_id: str, file_id: str) -> bool:
+        """Remove a specific file for a user. Returns True if deleted, False otherwise."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM user_files WHERE user_id = ? AND id = ?', (user_id, file_id))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            if deleted:
+                logger.info(f"Removed file {file_id} for user {user_id}")
+            else:
+                logger.warning(f"File {file_id} not found for user {user_id}")
+            return deleted
+    
     def get_user_stats(self, user_id: str) -> dict:
         """Get statistics for a user."""
         with self.get_connection() as conn:
