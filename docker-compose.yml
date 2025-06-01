@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  chatbot:
+    build: .
+    container_name: langgraph-chatbot
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_PATH=/data/db/chatbot.db
+      - UPLOAD_FOLDER=/data/uploads
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    volumes:
+      - ./chatbot.db:/data/db/chatbot.db
+      - ./uploads:/data/uploads
+    restart: unless-stopped
