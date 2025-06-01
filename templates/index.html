@@ -75,7 +75,10 @@
             flex-direction: column;
             padding: 24px;
             position: relative;
-            overflow: hidden;
+            overflow-y: auto;
+            overflow-x: hidden;
+            height: 100vh;
+            max-height: 100vh;
         }
 
         .sidebar::before {
@@ -920,23 +923,54 @@
         try {
             const response = await fetch('/files');
             const data = await response.json();
-            
             this.animateCounter('files-count', data.files.length);
-            
             let totalChunks = 0;
             const fileList = document.getElementById('file-list');
             if (data.files && data.files.length > 0) {
                 fileList.innerHTML = data.files.map(file => {
                     totalChunks += file.chunks_count || 0;
-                    return `<div class="file-item">📄 ${file.filename}<br><small>${file.chunks_count || 0} chunks</small></div>`;
+                    return `<div class="file-item" data-file-id="${file.id}">📄 ${file.filename}<br><small>${file.chunks_count || 0} chunks</small>
+                        <button class="delete-file-btn" data-file-id="${file.id}" title="Delete file" style="margin-top:6px;background:var(--error);color:white;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;float:right;">🗑️ Delete</button>
+                    </div>`;
                 }).join('');
+                // Attach delete event listeners
+                fileList.querySelectorAll('.delete-file-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const fileId = btn.getAttribute('data-file-id');
+                        this.deleteFile(fileId);
+                    });
+                });
             } else {
                 fileList.innerHTML = '<div class="file-item">📄 Ready for file analysis...</div>';
             }
-            
             this.animateCounter('chunks-count', totalChunks);
         } catch (error) {
             console.error('Error updating files:', error);
+        }
+    }
+
+    async deleteFile(fileId) {
+        if (!fileId) return;
+        if (!confirm('Are you sure you want to delete this file?')) return;
+        try {
+            const response = await fetch('/remove', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ file_id: fileId })
+            });
+            const data = await response.json();
+            if (data.error) {   
+                this.showNotification(`❌ ${data.error}`, 'error');
+            } else {
+                this.showNotification(`✅ ${data.message}`, 'success');
+                await this.updateFiles();
+                await this.updateStats();
+            }
+        } catch (error) {
+            this.showNotification(`❌ Delete error: ${error.message}`, 'error');
         }
     }
 
