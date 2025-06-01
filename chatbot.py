@@ -1,4 +1,3 @@
-
 # chatbot.py
 import os
 import json
@@ -9,7 +8,9 @@ from dataclasses import dataclass, asdict
 from flask import Flask, render_template, request, jsonify
 import uuid
 from typing_extensions import TypedDict
-
+import sqlite3
+from functools import wraps
+from io import BytesIO
 
 # LangGraph imports
 from langgraph.graph import StateGraph, END
@@ -20,11 +21,16 @@ from langchain_huggingface import HuggingFaceEmbeddings
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-import PyPDF2
-from io import BytesIO
+# PDF processing
+try:
+    import PyPDF2
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
+    print("Warning: PyPDF2 not installed. PDF support disabled.")
 
-# Configuration
-GROQ_API_KEY =  os.environ.get("GROQ_API_KEY"),  # This is the default and can be omitted
+
+GROQ_API_KEY =  os.environ.get("GROQ_API_KEY") # This is the default and can be omitted
   # Replace with your actual API key
 # MODEL_NAME = "mixtral-8x7b-32768"
 MODEL_NAME = 'llama3-8b-8192'
@@ -41,16 +47,203 @@ class MemoryItem:
 # Use TypedDict for LangGraph state compatibility
 class ChatState(TypedDict):
     messages: List[Dict[str, Any]]
-    short_term_memory: List[Dict[str, Any]]  # Store as dicts for serialization
+    short_term_memory: List[Dict[str, Any]]
     long_term_memory: List[Dict[str, Any]]
     uploaded_files: List[Dict[str, Any]]
     current_query: str
     tool_results: List[str]
     context: str
+    user_id: str  # ADD THIS LINE!
+
+
+class DatabaseManager:
+    def __init__(self, db_path="chatbot.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Memory table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                content TEXT,
+                is_user BOOLEAN,
+                importance FLOAT,
+                embedding BLOB,
+                memory_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # Files table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_files (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                filename TEXT,
+                content TEXT,
+                chunks TEXT,
+                embeddings BLOB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # Create indexes for better performance
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_memories_user_type 
+            ON memories (user_id, memory_type)
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_files_user 
+            ON user_files (user_id)
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def create_user(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR IGNORE INTO users (id) VALUES (?)
+        ''', (user_id,))
+        
+        conn.commit()
+        conn.close()
+    
+    def save_memory(self, user_id, memory_item, memory_type):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Ensure user exists
+        self.create_user(user_id)
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO memories 
+            (id, user_id, content, is_user, importance, embedding, memory_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            memory_item['id'], user_id, memory_item['content'],
+            memory_item['is_user'], memory_item['importance'],
+            json.dumps(memory_item.get('embedding', [])), memory_type
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        # Clean up old memories to maintain limits
+        self.cleanup_old_memories(user_id, memory_type)
+    
+    def cleanup_old_memories(self, user_id, memory_type):
+        """Keep only the most recent memories within limits"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        limit = 100 if memory_type == 'long_term' else 50  # Keep more long-term memories
+        
+        cursor.execute('''
+            DELETE FROM memories 
+            WHERE user_id = ? AND memory_type = ? 
+            AND id NOT IN (
+                SELECT id FROM memories 
+                WHERE user_id = ? AND memory_type = ?
+                ORDER BY created_at DESC LIMIT ?
+            )
+        ''', (user_id, memory_type, user_id, memory_type, limit))
+        
+        conn.commit()
+        conn.close()
+    
+    def load_memories(self, user_id, memory_type, limit=50):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, content, is_user, importance, embedding, created_at FROM memories 
+            WHERE user_id = ? AND memory_type = ?
+            ORDER BY created_at DESC LIMIT ?
+        ''', (user_id, memory_type, limit))
+        
+        memories = []
+        for row in cursor.fetchall():
+            memory = {
+                'id': row[0],
+                'content': row[1],
+                'is_user': bool(row[2]),
+                'importance': row[3],
+                'embedding': json.loads(row[4]) if row[4] else None,
+                'timestamp': row[5]
+            }
+            memories.append(memory)
+        
+        conn.close()
+        return memories
+    
+    def save_file(self, user_id, file_data):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Ensure user exists
+        self.create_user(user_id)
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_files 
+            (id, user_id, filename, content, chunks, embeddings)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            file_data['id'], user_id, file_data['filename'],
+            file_data['content'], json.dumps(file_data['chunks']),
+            json.dumps(file_data['embeddings'])
+        ))
+        
+        conn.commit()
+        conn.close()
+    
+    def load_files(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, filename, content, chunks, embeddings, created_at FROM user_files 
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        
+        files = []
+        for row in cursor.fetchall():
+            file_data = {
+                'id': row[0],
+                'filename': row[1],
+                'content': row[2],
+                'chunks': json.loads(row[3]),
+                'embeddings': json.loads(row[4]),
+                'timestamp': row[5]
+            }
+            files.append(file_data)
+        
+        conn.close()
+        return files
 
 class MemoryManager:
-    def __init__(self):
+    def __init__(self, db_manager):
         self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        self.db = db_manager
     
     def calculate_importance(self, message: str) -> float:
         """Calculate importance score for memory storage"""
@@ -72,8 +265,8 @@ class MemoryManager:
         
         return min(score, 10.0)
     
-    def add_to_memory(self, content: str, is_user: bool, short_term: List[Dict], long_term: List[Dict]):
-        """Add item to appropriate memory stores"""
+    def add_to_memory(self, content: str, is_user: bool, user_id: str):
+        """Add item to user's memory in database"""
         memory_item = {
             'id': str(uuid.uuid4()),
             'content': content,
@@ -83,21 +276,22 @@ class MemoryManager:
             'embedding': self.embeddings.embed_query(content)
         }
         
-        # Add to short-term (keep last 20 items)
-        short_term.append(memory_item)
-        if len(short_term) > 20:
-            short_term.pop(0)
+        # Save to short-term memory
+        self.db.save_memory(user_id, memory_item, 'short_term')
         
-        # Add to long-term if important (keep last 100 items)
+        # Save to long-term if important
         if memory_item['importance'] > 7.0:
-            long_term.append(memory_item)
-            if len(long_term) > 100:
-                long_term.pop(0)
+            self.db.save_memory(user_id, memory_item, 'long_term')
         
-        return short_term, long_term
+        return memory_item
     
-    def retrieve_relevant_memories(self, query: str, short_term: List[Dict], long_term: List[Dict], top_k: int = 5) -> List[Dict]:
+    def retrieve_relevant_memories(self, query: str, user_id: str, top_k: int = 5):
         """Retrieve relevant memories using semantic similarity"""
+        # Load both types of memories
+        short_term = self.db.load_memories(user_id, 'short_term', 20)
+        long_term = self.db.load_memories(user_id, 'long_term', 50)
+        
+        
         all_memories = short_term + long_term
         if not all_memories:
             return []
@@ -109,13 +303,13 @@ class MemoryManager:
             if memory.get('embedding'):
                 similarity = cosine_similarity([query_embedding], [memory['embedding']])[0][0]
                 similarities.append((memory, similarity))
-        
         # Sort by similarity and return top_k
         similarities.sort(key=lambda x: x[1], reverse=True)
         return [mem for mem, _ in similarities[:top_k]]
 
+
 class RAGManager:
-    def __init__(self):
+    def __init__(self): 
         self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     
     def process_file(self, file_content: str, filename: str) -> Dict[str, Any]:
@@ -180,13 +374,13 @@ def weather_tool(location: str = "current location") -> str:
     return f"Weather in {location}: {temp}°C, {condition}"
 
 class ChatbotAgent:
-    def __init__(self):
+    def __init__(self, db_manager):
         self.llm = ChatGroq(
-            # groq_api_key=GROQ_API_KEY,
             model=MODEL_NAME,
             temperature=0.7
         )
-        self.memory_manager = MemoryManager()
+        self.db_manager = db_manager
+        self.memory_manager = MemoryManager(db_manager)
         self.rag_manager = RAGManager()
         self.tools = [calculator_tool, datetime_tool, weather_tool]
     
@@ -213,6 +407,35 @@ class ChatbotAgent:
         
         return graph.compile()
     
+    def process_chat(self, user_state, user_id):
+        """Process chat with user-specific state and database persistence"""
+        # Update state with current query
+        user_state["tool_results"] = []  # Reset tool results
+        
+        # Store user_id in state for access in graph nodes
+        user_state["user_id"] = user_id
+        
+        # Run the graph with user state
+        result = self.create_graph().invoke(user_state)
+        # Save new memories to database
+        if result["messages"]:
+            latest_ai_message = result["messages"][-1]['content']
+            # Save both user and AI messages
+            self.memory_manager.add_to_memory(user_state["current_query"], True, user_id)
+            self.memory_manager.add_to_memory(latest_ai_message, False, user_id)
+        
+        # Get updated memory stats
+        short_term_count = len(self.db_manager.load_memories(user_id, 'short_term', 1000))
+        long_term_count = len(self.db_manager.load_memories(user_id, 'long_term', 1000))
+        
+        return {
+            'response': result["messages"][-1]['content'] if result["messages"] else "I'm sorry, I couldn't process your request.",
+            'memory_stats': {
+                'short_term': short_term_count,
+                'long_term': long_term_count
+            }
+        }
+    
     def process_input(self, state: ChatState) -> ChatState:
         """Process the input query"""
         # Add user message to conversation
@@ -227,18 +450,22 @@ class ChatbotAgent:
     def retrieve_context(self, state: ChatState) -> ChatState:
         """Retrieve relevant context from memory and files"""
         context_parts = []
+        user_id = state.get("user_id")
+        print("USER ID", user_id)
+        if user_id:
+            # Get relevant memories using user_id
+            relevant_memories = self.memory_manager.retrieve_relevant_memories(
+                state["current_query"], user_id
+            )
+
+            if relevant_memories:
+                memory_context = "Relevant conversation history:\n"
+                for mem in relevant_memories:
+                    memory_context += f"- {mem['content']}\n"
+                context_parts.append(memory_context)
         
-        # Get relevant memories
-        relevant_memories = self.memory_manager.retrieve_relevant_memories(
-            state["current_query"], state["short_term_memory"], state["long_term_memory"]
-        )
-        if relevant_memories:
-            memory_context = "Relevant conversation history:\n"
-            for mem in relevant_memories:
-                memory_context += f"- {mem['content']}\n"
-            context_parts.append(memory_context)
-        
-        # Get relevant file chunks
+        print("Retrieved context parts:", context_parts)
+        # Get relevant file chunks (files are already user-specific in state)
         relevant_chunks = self.rag_manager.retrieve_relevant_chunks(
             state["current_query"], state["uploaded_files"]
         )
@@ -320,83 +547,78 @@ class ChatbotAgent:
         return state
     
     def update_memory(self, state: ChatState) -> ChatState:
-        """Update memory with new conversation"""
-        # Add user message to memory
-        state["short_term_memory"], state["long_term_memory"] = self.memory_manager.add_to_memory(
-            state["current_query"], True, state["short_term_memory"], state["long_term_memory"]
-        )
-        
-        # Add AI response to memory
-        ai_response = state["messages"][-1]["content"]
-        state["short_term_memory"], state["long_term_memory"] = self.memory_manager.add_to_memory(
-            ai_response, False, state["short_term_memory"], state["long_term_memory"]
-        )
-        
+        """Memory updates are handled in process_chat method"""
         return state
 
 # Flask Web Interface
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here'
 
-# Global chatbot instance
-chatbot = ChatbotAgent()
-graph = chatbot.create_graph()
+# Session management decorator
+def get_or_create_user_session():
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user_id = request.headers.get('X-User-ID') or request.cookies.get('user_id')
+            if not user_id:
+                user_id = 'user_' + str(uuid.uuid4())
+            request.user_id = user_id
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
-# Global state (in production, use proper session management)
-chat_state = {
-    "messages": [],
-    "short_term_memory": [],
-    "long_term_memory": [],
-    "uploaded_files": [],
-    "current_query": "",
-    "tool_results": [],
-    "context": ""
-}
+# Initialize database and chatbot
+db_manager = DatabaseManager()
+chatbot = ChatbotAgent(db_manager)
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/chat', methods=['POST'])
+@get_or_create_user_session()
 def chat():
-    global chat_state
-    
     data = request.json
     user_message = data.get('message', '')
+    user_id = request.user_id
     
     if not user_message:
         return jsonify({'error': 'No message provided'}), 400
     
     try:
-        # Update state with current query
-        chat_state["current_query"] = user_message
-        chat_state["tool_results"] = []  # Reset tool results
+        # Load user's persistent data
+        user_state = {
+            "messages": [],
+            "short_term_memory": db_manager.load_memories(user_id, 'short_term', 20),
+            "long_term_memory": db_manager.load_memories(user_id, 'long_term', 50),
+            "uploaded_files": db_manager.load_files(user_id),
+            "current_query": user_message,
+            "tool_results": [],
+            "context": ""
+        }
+
+   
         
-        # Run the graph
-        result = graph.invoke(chat_state)
+        # Process with chatbot
+        result = chatbot.process_chat(user_state, user_id)
         
-        # Get the latest AI response
-        ai_response = result["messages"][-1]['content'] if result["messages"] else "I'm sorry, I couldn't process your request."
-        
-        # Update global state
-        chat_state.update(result)
-        
-        return jsonify({
-            'response': ai_response,
-            'memory_stats': {
-                'short_term': len(chat_state["short_term_memory"]),
-                'long_term': len(chat_state["long_term_memory"])
-            },
-            'files_count': len(chat_state["uploaded_files"])
+        response = jsonify({
+            'response': result['response'],
+            'memory_stats': result['memory_stats'],
+            'files_count': len(user_state["uploaded_files"])
         })
-    
+        
+        # Set user cookie if new user
+        response.set_cookie('user_id', user_id, max_age=30*24*60*60)  # 30 days
+        return response
+        
     except Exception as e:
         return jsonify({'error': f'Error processing message: {str(e)}'}), 500
 
-# Update the upload route:
 @app.route('/upload', methods=['POST'])
+@get_or_create_user_session()
 def upload_file():
-    global chat_state
+    user_id = request.user_id
     
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
@@ -407,47 +629,65 @@ def upload_file():
     
     try:
         # Check file type and process accordingly
-        if file.filename.lower().endswith('.pdf'):
+        if file.filename.lower().endswith('.pdf') and PDF_SUPPORT:
             # Process PDF file
             pdf_reader = PyPDF2.PdfReader(BytesIO(file.read()))
             file_content = ""
             for page in pdf_reader.pages:
                 file_content += page.extract_text() + "\n"
+        elif file.filename.lower().endswith('.pdf') and not PDF_SUPPORT:
+            return jsonify({'error': 'PDF support not available. Install PyPDF2 to enable PDF uploads.'}), 400
         else:
             # Process text files
             file_content = file.read().decode('utf-8')
         
         # Process file for RAG
         file_data = chatbot.rag_manager.process_file(file_content, file.filename)
-        chat_state["uploaded_files"].append(file_data)
         
-        return jsonify({
+        # Save to database
+        db_manager.save_file(user_id, file_data)
+        
+        response = jsonify({
             'message': f'File {file.filename} uploaded successfully',
-            'files_count': len(chat_state["uploaded_files"])
+            'files_count': len(db_manager.load_files(user_id))
         })
+        
+        # Set user cookie
+        response.set_cookie('user_id', user_id, max_age=30*24*60*60)  # 30 days
+        return response
     
     except Exception as e:
         return jsonify({'error': f'Error uploading file: {str(e)}'}), 500
 
 @app.route('/memory')
+@get_or_create_user_session()
 def get_memory():
-    global chat_state
-
-    return jsonify({
-        'short_term': chat_state["short_term_memory"][-10:],
-        'long_term': chat_state["long_term_memory"][-20:],
+    user_id = request.user_id
+    
+    short_term = db_manager.load_memories(user_id, 'short_term', 10)
+    long_term = db_manager.load_memories(user_id, 'long_term', 20)
+    
+    response = jsonify({
+        'short_term': short_term,
+        'long_term': long_term,
         'stats': {
-            'short_term_count': len(chat_state['short_term_memory']),
-            'long_term_count': len(chat_state['long_term_memory'])
+            'short_term_count': len(db_manager.load_memories(user_id, 'short_term', 1000)),
+            'long_term_count': len(db_manager.load_memories(user_id, 'long_term', 1000))
         }
     })
+    
+    # Set user cookie
+    response.set_cookie('user_id', user_id, max_age=30*24*60*60)  # 30 days
+    return response
 
 @app.route('/files')
+@get_or_create_user_session()
 def get_files():
-    global chat_state
+    user_id = request.user_id
+    files = db_manager.load_files(user_id)
     
     files_info = []
-    for file in chat_state['uploaded_files']:
+    for file in files:
         files_info.append({
             'id': file['id'],
             'filename': file['filename'],
@@ -455,8 +695,35 @@ def get_files():
             'chunks_count': len(file['chunks'])
         })
     
-    return jsonify({'files': files_info})
+    response = jsonify({'files': files_info})
+    
+    # Set user cookie
+    response.set_cookie('user_id', user_id, max_age=30*24*60*60)  # 30 days
+    return response
+
+@app.route('/clear_memory', methods=['POST'])
+@get_or_create_user_session()
+def clear_memory():
+    """Clear user's memory (for testing/reset purposes)"""
+    user_id = request.user_id
+    
+    try:
+        conn = sqlite3.connect(db_manager.db_path)
+        cursor = conn.cursor()
+        
+        # Delete user's memories
+        cursor.execute('DELETE FROM memories WHERE user_id = ?', (user_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'message': 'Memory cleared successfully'})
+    
+    except Exception as e:
+        return jsonify({'error': f'Error clearing memory: {str(e)}'}), 500
 
 if __name__ == '__main__':
-    print("Starting LangGraph Chatbot...")
+    print("Starting LangGraph Chatbot with Persistent Memory...")
+
+
     app.run(debug=True, host='0.0.0.0', port=8000)
