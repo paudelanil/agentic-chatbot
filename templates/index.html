@@ -769,26 +769,93 @@
         this.chatInput.style.height = 'auto';
         this.setLoading(true);
 
+        // Prepare messages array for context
+        const messages = Array.from(this.chatMessages.querySelectorAll('.message')).map(msg => {
+            const sender = msg.classList.contains('user') ? 'user' : 'assistant';
+            const content = msg.querySelector('.message-content').textContent.trim();
+            return { role: sender, content };
+        });
+
+        // Add assistant message placeholder
+        const assistantDiv = document.createElement('div');
+        assistantDiv.className = 'message assistant';
+        const avatar = document.createElement('div');
+        avatar.className = 'message-avatar';
+        avatar.textContent = '🤖';
+        const messageContent = document.createElement('div');
+        messageContent.className = 'message-content';
+        assistantDiv.appendChild(avatar);
+        assistantDiv.appendChild(messageContent);
+        this.chatMessages.appendChild(assistantDiv);
+        this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
+
+        let aiText = '';
+
         try {
-            const response = await fetch('/chat', {
+            const response = await fetch('/chat/stream', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'X-User-ID': sessionStorage.getItem('user_id') || (() => {
+                        const id = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+                        sessionStorage.setItem('user_id', id);
+                        return id;
+                    })()
                 },
-                body: JSON.stringify({ message: message })
+                body: JSON.stringify({ message, messages })
             });
 
-            const data = await response.json();
-            
-            if (data.error) {
-                this.addMessage(`❌ Error: ${data.error}`, 'assistant');
-            } else {
-                this.addMessage(data.response, 'assistant');
-                this.updateStatsFromResponse(data);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
+
+            if (!response.body) {
+                throw new Error('No response body available');
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                buffer += chunk;
+
+                // Process complete SSE messages
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = line.slice(6); // Remove 'data: ' prefix
+
+                        if (data === '[DONE]') {
+                            // End of stream
+                            continue;
+                        } else if (data.startsWith('[ERROR:')) {
+                            // Error occurred
+                            messageContent.innerHTML += ` ${data}`;
+                            continue;
+                        } else if (data.trim()) {
+                            // Regular content - unescape newlines
+                            const unescapedData = data.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+                            aiText += unescapedData;
+                            // Convert newlines to <br> for HTML display
+                            messageContent.innerHTML = aiText.replace(/\n/g, '<br>');
+                            this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
+                        }
+                    }
+                }
+            }
+
+            this.setLoading(false);
+
         } catch (error) {
-            this.addMessage(`❌ Connection Error: ${error.message}`, 'assistant');
-        } finally {
+            console.error('Streaming error:', error);
+            messageContent.innerHTML = `❌ Connection Error: ${error.message}`;
             this.setLoading(false);
         }
     }

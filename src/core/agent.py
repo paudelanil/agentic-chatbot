@@ -41,9 +41,19 @@ class AgentCore:
             if memory_context:
                 context_parts.append(memory_context)
         # RAG context (if files present)
-        relevant_chunks = self.rag_manager.retrieve_relevant_chunks(
-            state["current_query"], state.get("uploaded_files", [])
-        )
+        uploaded_files = state.get("uploaded_files", [])
+        # Defensive: if uploaded_files is a list of dicts, extract user_id; if it's a list of lists, flatten or fix
+        if uploaded_files and isinstance(uploaded_files, list):
+            if all(isinstance(f, dict) for f in uploaded_files):
+                # Use user_id as before
+                relevant_chunks = self.rag_manager.retrieve_relevant_chunks(
+                    state["current_query"], user_id
+                )
+            else:
+                print(f"[DEBUG] uploaded_files is not a list of dicts: {uploaded_files}")
+                relevant_chunks = []
+        else:
+            relevant_chunks = []
         if relevant_chunks:
             file_context = "Relevant information from uploaded files:\n"
             for chunk in relevant_chunks:

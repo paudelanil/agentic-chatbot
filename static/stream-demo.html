@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>LangGraph Streaming Chat Demo</title>
+  <style>
+    body { font-family: sans-serif; background: #f4f4f4; margin: 0; padding: 0; }
+    #chat { max-width: 600px; margin: 40px auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px #0001; padding: 24px; }
+    #messages { min-height: 200px; margin-bottom: 16px; }
+    .msg { margin: 8px 0; }
+    .user { color: #6366f1; font-weight: bold; }
+    .assistant { color: #222; }
+    #input-area { display: flex; gap: 8px; }
+    #input { flex: 1; padding: 8px; font-size: 16px; border-radius: 4px; border: 1px solid #ccc; }
+    #send { padding: 8px 16px; font-size: 16px; border-radius: 4px; border: none; background: #6366f1; color: #fff; cursor: pointer; }
+    #send:disabled { background: #bbb; }
+  </style>
+</head>
+<body>
+  <div id="chat">
+    <h2>LangGraph Streaming Chat</h2>
+    <div id="messages"></div>
+    <div id="input-area">
+      <input id="input" type="text" placeholder="Type your message..." autocomplete="off" />
+      <button id="send">Send</button>
+    </div>
+  </div>
+  <script>
+    const messagesDiv = document.getElementById('messages');
+    const input = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+    let chatHistory = [];
+
+    function addMessage(text, sender) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + sender;
+      div.textContent = (sender === 'user' ? 'You: ' : 'AI: ') + text;
+      messagesDiv.appendChild(div);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    function addStreamingMessage() {
+      const div = document.createElement('div');
+      div.className = 'msg assistant';
+      div.id = 'streaming-msg';
+      div.textContent = 'AI: ';
+      messagesDiv.appendChild(div);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      return div;
+    }
+
+    sendBtn.onclick = async function() {
+      const text = input.value.trim();
+      if (!text) return;
+      addMessage(text, 'user');
+      chatHistory.push({ role: 'user', content: text });
+      input.value = '';
+      sendBtn.disabled = true;
+
+      // Streaming fetch
+      const streamingDiv = addStreamingMessage();
+      let aiText = '';
+      
+      try {
+        const resp = await fetch('http://localhost:8000/chat/stream', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-User-ID': sessionStorage.getItem('user_id') || (function() {
+              const id = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+              sessionStorage.setItem('user_id', id);
+              return id;
+            })()
+          },
+          body: JSON.stringify({ message: text, messages: chatHistory })
+        });
+        
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+        }
+        
+        if (!resp.body) {
+          streamingDiv.textContent += '[No stream available]';
+          sendBtn.disabled = false;
+          return;
+        }
+        
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          
+          const chunk = decoder.decode(value, { stream: true });
+          buffer += chunk;
+          
+          // Process complete SSE messages
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line in buffer
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6); // Remove 'data: ' prefix
+              
+              if (data === '[DONE]') {
+                // End of stream
+                continue;
+              } else if (data.startsWith('[ERROR:')) {
+                // Error occurred
+                streamingDiv.textContent += ` ${data}`;
+                continue;
+              } else if (data.trim()) {
+                // Regular content - unescape newlines
+                const unescapedData = data.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+                aiText += unescapedData;
+                streamingDiv.textContent = 'AI: ' + aiText;
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+              }
+            }
+          }
+        }
+        
+        if (aiText.trim()) {
+          chatHistory.push({ role: 'assistant', content: aiText });
+        }
+        
+      } catch (error) {
+        console.error('Streaming error:', error);
+        streamingDiv.textContent += ` [Error: ${error.message}]`;
+      } finally {
+        sendBtn.disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>
