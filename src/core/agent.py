@@ -4,6 +4,8 @@ from ..rag.manager import RAGManager
 from ..tools.calculator import calculator_tool
 from ..tools.datetime_tool import datetime_tool
 from ..tools.weather import weather_tool
+from ..tools.appointment import appointment_tool
+from ..tools import AVAILABLE_TOOLS
 from config.settings import settings
 from dataclasses import asdict
 
@@ -17,7 +19,10 @@ class AgentCore:
         )
         self.memory_manager = MemoryManager(db_manager)
         self.rag_manager = RAGManager(db_manager)
-        self.tools = [calculator_tool, datetime_tool, weather_tool]
+        self.tools = AVAILABLE_TOOLS
+        self.tool_map = {tool.name: tool for tool in self.tools}
+        # Bind tools to LLM for ReAct agent
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
 
     def process_input(self, state):
         """Add user message to conversation."""
@@ -118,4 +123,52 @@ class AgentCore:
 
     def update_memory(self, state):
         """Memory updates are handled outside the graph."""
+        return state
+
+
+    def llm_decide_and_act(self, state):
+        state = asdict(state)
+        from langchain.schema import SystemMessage, HumanMessage, AIMessage
+        # User-friendly ReAct-style prompt: do not mention tool names or tool-calling in responses
+        system_prompt = (
+            "You are a helpful AI assistant. You have access to the following tools: "
+            + ", ".join([f"{tool.name} ({tool.description})" for tool in self.tools]) + ". "
+            "If the user request is missing information, ask for it conversationally and naturally. "
+            "When you have all the information, use the appropriate tool internally, but do not mention tool names or tool usage in your response. "
+            "After completing a task, simply provide the result to the user in a friendly, natural way. "
+            "If no tool is needed, answer directly."
+        )
+        messages = [SystemMessage(content=system_prompt)]
+        if state.get("context"):
+            messages.append(SystemMessage(content=f"Relevant context:\n{state['context']}"))
+        for msg in state["messages"][-5:]:
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            else:
+                messages.append(AIMessage(content=msg["content"]))
+        response = self.llm_with_tools.invoke(messages)
+        # If a tool was used, response will have .tool_calls
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            for call in response.tool_calls:
+                tool_name = call["name"]
+                tool_args = call["args"]
+                tool = self.tool_map.get(tool_name)
+                if tool:
+                    tool_result = tool.invoke(tool_args)
+                    state["messages"].append({
+                        "role": "assistant",
+                        "content": str(tool_result),
+                        "timestamp": state.get("timestamp")
+                    })
+                    state["tool_results"].append(f"{tool_name}: {tool_result}")
+                    state["_react_continue"] = True
+                    return state
+        # Otherwise, treat as final answer
+        ai_message = {
+            "role": "assistant",
+            "content": response.content.strip(),
+            "timestamp": state.get("timestamp")
+        }
+        state["messages"].append(ai_message)
+        state["_react_continue"] = False
         return state
