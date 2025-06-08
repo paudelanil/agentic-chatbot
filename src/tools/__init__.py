@@ -5,18 +5,20 @@ This module provides various tools that the chatbot can use to perform specific 
 from .calculator import calculator_tool
 from .datetime_tool import datetime_tool
 from .weather import weather_tool
+from .appointment import appointment_tool
 
 # Registry of all available tools
 AVAILABLE_TOOLS = [
     calculator_tool,
     datetime_tool,
     weather_tool,
+    appointment_tool,
 ]
 
 # Tool categories for organization
 TOOL_CATEGORIES = {
     'math': [calculator_tool],
-    'utility': [datetime_tool],
+    'utility': [datetime_tool, appointment_tool],
     'information': [weather_tool],
 }
 
@@ -39,6 +41,7 @@ __all__ = [
     'calculator_tool',
     'datetime_tool', 
     'weather_tool',
+    'appointment_tool',
     'AVAILABLE_TOOLS',
     'TOOL_CATEGORIES',
     'get_all_tools',
